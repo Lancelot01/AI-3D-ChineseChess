@@ -1075,10 +1075,11 @@ function notation(bd, m) {
 
   // 小盤 AI 的深度以半回合（ply）計算，和大盤難度標示一致。
   var D_AI_CFG = [
-    {depth:1,timeMs:100}, {depth:2,timeMs:280},
-    {depth:4,timeMs:800}, {depth:6,timeMs:1800}
+    {depth:1,timeMs:120,maxNodes:20000,chancePly:1}, {depth:2,timeMs:360,maxNodes:180000,chancePly:1},
+    {depth:4,timeMs:1050,maxNodes:650000,chancePly:1}, {depth:6,timeMs:2200,maxNodes:1400000,chancePly:1}
   ];
-  var D_MATE=1000000,DSearch={nodes:0,stopAt:0,aborted:false};
+  var D_MATE=1000000,DSearch={nodes:0,stopAt:0,maxNodes:0,aborted:false,completedDepth:0,tt:null,ruleKey:''};
+  var DTYPE_CODE={king:'K',guard:'G',elephant:'E',rook:'R',knight:'N',cannon:'C',pawn:'P'};
 
   function darkForAI(side,value){return side===D.sides[1]?value:-value;}
 
@@ -1092,16 +1093,17 @@ function notation(bd, m) {
       if(found)found.count++;else bag.push({key:key,side:p.side,type:p.type,count:1});
       total++;
     });
+    bag.sort(function(a,b){return a.key<b.key?-1:a.key>b.key?1:0;});
     return{items:bag,total:total};
   }
 
-  function darkPositionScore(){
+  function darkPositionScore(bag){
+    bag=bag||darkHiddenBag();
     var score=0;
     D.board.forEach(function(p,i){
-      if(!p)return;
+      if(!p||!p.revealed)return;
       var value=DVAL[p.type];
       score+=darkForAI(p.side,value);
-      if(!p.revealed)return;
       var moves=darkLegalMoves(i),activity=14+moves.length*5,captures=0;
       moves.forEach(function(m){
         // 葉節點也要看得到下一手可被吃，簡單難度才不會無條件送子。
@@ -1109,12 +1111,15 @@ function notation(bd, m) {
       });
       score+=darkForAI(p.side,activity+captures);
     });
+    bag.items.forEach(function(item){score+=darkForAI(item.side,DVAL[item.type]*item.count);});
     return Math.round(score);
   }
 
-  function darkTerminalScore(actor,ply){
+  function darkTerminalScore(actor,ply,bag,noProgress){
+    if(noProgress>=40)return 0;
     var cnt={red:0,black:0};
-    D.board.forEach(function(p){if(p)cnt[p.side]++;});
+    D.board.forEach(function(p){if(p&&p.revealed)cnt[p.side]++;});
+    bag.items.forEach(function(item){cnt[item.side]+=item.count;});
     if(cnt.red===0||cnt.black===0){
       var winner=cnt.red>0?DRED:DBLACK;
       return winner===D.sides[1]?D_MATE-ply:-D_MATE+ply;
@@ -1129,45 +1134,6 @@ function notation(bd, m) {
     return null;
   }
 
-  function darkRevealPositionBonus(pos,side,type){
-    var q=dXY(pos),center=3.5-Math.abs(q.y-3.5),edge=(q.x===0||q.x===3||q.y===0||q.y===7);
-    var bonus=18+center*3+(edge?4:0);
-    if(type==='rook'||type==='cannon')bonus+=10;
-    else if(type==='knight')bonus+=7;
-    return darkForAI(side,bonus);
-  }
-
-  // 翻棋與暗吃是機率節點。以剩餘暗子袋計算期望分，不偷看目標格。
-  function darkChanceScore(a,actor){
-    var base=darkPositionScore(),bag=darkHiddenBag();
-    if(!bag.total)return base;
-    var sum=0,p=a.from!=null?D.board[a.from]:null,counts={red:0,black:0};
-    D.board.forEach(function(z){if(z)counts[z.side]++;});
-    bag.items.forEach(function(item){
-      var delta=darkRevealPositionBonus(a.type==='reveal'?a.from:a.to,item.side,item.type),terminal=null;
-      if(a.type!=='reveal'&&p){
-        if(item.side===p.side){
-          // 暗吃翻到己方：雙方存活，目標棋被翻開。
-          delta+=darkForAI(p.side,8);
-        }else{
-          var wins=a.kind==='darkcannon'||(p.type!=='cannon'&&!(p.type==='king'&&item.type==='pawn')&&
-            (p.type==='pawn'&&item.type==='king'||DTYPE[p.type].rank>=DTYPE[item.type].rank));
-          if(wins){
-            delta+=darkForAI(p.side,DVAL[item.type]);
-            // 吃成後的目的格安全以交換折損近似，避免暗吃只看收益。
-            delta-=darkForAI(p.side,DVAL[p.type]*.18);
-            if(counts[item.side]===1)terminal=p.side===D.sides[1]?D_MATE-1:-D_MATE+1;
-          }else{
-            delta-=darkForAI(p.side,DVAL[p.type]);
-            if(counts[p.side]===1)terminal=item.side===D.sides[1]?D_MATE-1:-D_MATE+1;
-          }
-        }
-      }
-      sum+=(terminal===null?base+delta:terminal)*item.count;
-    });
-    return sum/bag.total;
-  }
-
   function darkApplyKnown(a){
     var oldFrom=D.board[a.from],oldTo=D.board[a.to];
     D.board[a.to]=oldFrom;D.board[a.from]=null;
@@ -1175,9 +1141,58 @@ function notation(bd, m) {
   }
   function darkUndoKnown(u){D.board[u.from]=u.oldFrom;D.board[u.to]=u.oldTo;}
 
+  function darkChanceWins(attacker,item,kind){
+    if(kind==='darkcannon')return true;
+    if(attacker.type==='king'&&item.type==='pawn')return false;
+    if(attacker.type==='pawn'&&item.type==='king')return true;
+    return DTYPE[attacker.type].rank>=DTYPE[item.type].rank;
+  }
+
+  function darkApplyChance(a,item){
+    var f=a.from,t=a.type==='reveal'?a.from:a.to;
+    var u={from:f,to:t,oldFrom:D.board[f],oldTo:D.board[t]};
+    var revealed={id:'search-'+item.key,side:item.side,type:item.type,revealed:true};
+    if(a.type==='reveal')D.board[f]=revealed;
+    else{
+      var attacker=D.board[f];
+      if(item.side===attacker.side)D.board[t]=revealed;
+      else if(darkChanceWins(attacker,item,a.kind)){D.board[t]=attacker;D.board[f]=null;}
+      else{D.board[f]=null;D.board[t]=revealed;}
+    }
+    return u;
+  }
+  function darkUndoChance(u){
+    D.board[u.from]=u.oldFrom;
+    if(u.to!==u.from)D.board[u.to]=u.oldTo;
+  }
+
+  function darkShouldAbort(){
+    if(DSearch.aborted)return true;
+    if(DSearch.nodes>=DSearch.maxNodes||performance.now()>DSearch.stopAt)DSearch.aborted=true;
+    return DSearch.aborted;
+  }
+
+  function darkActionKey(a){return a.type+':'+a.from+':'+(a.to==null?'':a.to)+':'+(a.kind||'');}
+
+  function darkStateKey(actor,depth,noProgress,bag,chanceLeft){
+    var board='';
+    for(var i=0;i<D.board.length;i++){
+      var p=D.board[i];
+      board+=!p?'.':!p.revealed?'?':(p.side===DRED?'r':'b')+DTYPE_CODE[p.type];
+    }
+    var counts='';
+    for(var j=0;j<bag.items.length;j++)counts+=bag.items[j].key+'='+bag.items[j].count+',';
+    return DSearch.ruleKey+'|'+actor+'|'+depth+'|'+chanceLeft+'|'+noProgress+'|'+board+'|'+counts;
+  }
+
   function darkActionOrderScore(a,actor){
     if(a.type==='reveal'){
-      var q=dXY(a.from);return 30+((q.x===0||q.x===3||q.y===0||q.y===7)?6:0);
+      var q=dXY(a.from),score=30+((q.x===0||q.x===3||q.y===0||q.y===7)?6:0);
+      DDIR.forEach(function(d){
+        var x=q.x+d[0],y=q.y+d[1];if(!dIn(x,y))return;
+        var n=D.board[dIdx(x,y)];if(n&&n.revealed)score+=n.side===D.sides[actor]?9:16;
+      });
+      return score;
     }
     var p=D.board[a.from],t=D.board[a.to],s=10;
     if(a.kind==='darkcapture'||a.kind==='darkcannon')return 80+(a.kind==='darkcannon'?20:0);
@@ -1186,60 +1201,107 @@ function notation(bd, m) {
     return s;
   }
 
-  function darkOrderedActions(actor,depth){
+  function darkOrderedActions(actor,depth,preferred,internal){
     var acts=darkAllActions(actor);
-    acts.sort(function(a,b){return darkActionOrderScore(b,actor)-darkActionOrderScore(a,actor);});
-    // 深層只裁減低優先翻棋，吃子與特殊著永遠保留。
-    var limit=depth>=5?9:depth>=3?12:depth===2?20:acts.length;
+    acts.sort(function(a,b){
+      var d=darkActionOrderScore(b,actor)-darkActionOrderScore(a,actor);
+      if(d)return d;var ak=darkActionKey(a),bk=darkActionKey(b);return ak<bk?-1:ak>bk?1:0;
+    });
+    var preferredKey=preferred?darkActionKey(preferred):'',pi=-1;
+    if(preferredKey)for(var p=0;p<acts.length;p++)if(darkActionKey(acts[p])===preferredKey){pi=p;break;}
+    if(pi>0){var pv=acts.splice(pi,1)[0];acts.unshift(pv);}
+    // 吃子與暗吃全部保留；深層只裁減低優先翻棋和安靜著。
+    var limit=depth>=5?10:depth>=3?14:depth===2?16:depth===1&&internal?12:acts.length;
     if(acts.length<=limit)return acts;
-    var keep=acts.filter(function(a){return a.type!=='reveal';});
-    for(var i=0;i<acts.length&&keep.length<limit;i++)if(acts[i].type==='reveal')keep.push(acts[i]);
+    var keep=acts.filter(function(a){return a.kind==='capture'||a.kind==='darkcapture'||a.kind==='darkcannon';});
+    if(preferredKey&&!keep.some(function(a){return darkActionKey(a)===preferredKey;})){
+      for(var k=0;k<acts.length;k++)if(darkActionKey(acts[k])===preferredKey){keep.unshift(acts[k]);break;}
+    }
+    for(var i=0;i<acts.length&&keep.length<limit;i++)if(!keep.some(function(x){return darkActionKey(x)===darkActionKey(acts[i]);}))keep.push(acts[i]);
     return keep;
   }
 
-  function darkSearch(actor,depth,alpha,beta,ply){
+  function darkChanceLeaf(a,actor,ply,bag){
+    var total=bag.total,sum=0;if(!total)return darkPositionScore(bag);
+    for(var i=0;i<bag.items.length;i++){
+      var item=bag.items[i],count=item.count;if(!count)continue;
+      if(darkShouldAbort())return 0;
+      item.count--;bag.total--;
+      var undo=darkApplyChance(a,item);
+      var terminal=darkTerminalScore(1-actor,ply+1,bag,0);
+      var child=terminal===null?darkPositionScore(bag):terminal;
+      darkUndoChance(undo);item.count++;bag.total++;
+      sum+=child*count;
+    }
+    return sum/total;
+  }
+
+  function darkChanceSearch(a,actor,depth,ply,bag,chanceLeft){
+    var total=bag.total,sum=0;if(!total)return darkPositionScore(bag);
+    for(var i=0;i<bag.items.length;i++){
+      var item=bag.items[i],count=item.count;if(!count)continue;
+      if(darkShouldAbort())return 0;
+      item.count--;bag.total--;
+      var undo=darkApplyChance(a,item);
+      var child=darkSearch(1-actor,depth-1,-Infinity,Infinity,ply+1,bag,0,chanceLeft-1);
+      darkUndoChance(undo);item.count++;bag.total++;
+      if(DSearch.aborted)return 0;
+      sum+=child*count;
+    }
+    return sum/total;
+  }
+
+  function darkSearch(actor,depth,alpha,beta,ply,bag,noProgress,chanceLeft){
     DSearch.nodes++;
-    if((DSearch.nodes&255)===0&&performance.now()>DSearch.stopAt)DSearch.aborted=true;
-    if(DSearch.aborted)return 0;
-    var terminal=darkTerminalScore(actor,ply);if(terminal!==null)return terminal;
-    if(depth<=0)return darkPositionScore();
-    var acts=darkOrderedActions(actor,depth),maximizing=actor===1;
+    if(darkShouldAbort())return 0;
+    var terminal=darkTerminalScore(actor,ply,bag,noProgress);if(terminal!==null)return terminal;
+    if(depth<=0)return darkPositionScore(bag);
+    var fullWindow=alpha===-Infinity&&beta===Infinity,key=fullWindow?darkStateKey(actor,depth,noProgress,bag,chanceLeft):null;
+    if(key&&DSearch.tt.has(key))return DSearch.tt.get(key);
+    var acts=darkOrderedActions(actor,depth,null,true),maximizing=actor===1;
     if(!acts.length)return maximizing?-D_MATE+ply:D_MATE-ply;
-    var best=maximizing?-Infinity:Infinity;
+    var best=maximizing?-Infinity:Infinity,cutoff=false;
     for(var i=0;i<acts.length;i++){
+      if(darkShouldAbort())return 0;
       var a=acts[i],uncertain=a.type==='reveal'||a.kind==='darkcapture'||a.kind==='darkcannon',score;
-      if(uncertain)score=darkChanceScore(a,actor);
+      if(uncertain)score=chanceLeft>0?darkChanceSearch(a,actor,depth,ply,bag,chanceLeft):darkChanceLeaf(a,actor,ply,bag);
       else{
         var undo=darkApplyKnown(a);
-        score=darkSearch(1-actor,depth-1,alpha,beta,ply+1);
+        var nextProgress=undo.oldTo?0:noProgress+1;
+        score=darkSearch(1-actor,depth-1,alpha,beta,ply+1,bag,nextProgress,chanceLeft);
         darkUndoKnown(undo);
       }
       if(DSearch.aborted)return 0;
       if(maximizing){if(score>best)best=score;if(best>alpha)alpha=best;}
       else{if(score<best)best=score;if(best<beta)beta=best;}
-      if(beta<=alpha)break;
+      if(beta<=alpha){cutoff=true;break;}
     }
+    if(key&&!cutoff&&!DSearch.aborted&&DSearch.tt.size<60000)DSearch.tt.set(key,best);
     return best;
   }
 
   function darkChooseAI(){
-    var cfg=D_AI_CFG[G.level],legal=darkOrderedActions(1,1);if(!legal.length)return null;
-    DSearch.nodes=0;DSearch.stopAt=performance.now()+cfg.timeMs;DSearch.aborted=false;
+    var cfg=D_AI_CFG[G.level],bag=darkHiddenBag(),legal=darkOrderedActions(1,1,null);if(!legal.length)return null;
+    DSearch.nodes=0;DSearch.stopAt=performance.now()+cfg.timeMs;DSearch.maxNodes=cfg.maxNodes;DSearch.aborted=false;DSearch.completedDepth=0;DSearch.tt=new Map();
+    DSearch.ruleKey=(darkEatOn()?'e':'-')+(darkRookRushOn()?'r':'-')+(darkCannonJumpOn()?'c':'-')+(darkHorseLOn()?'h':'-');
     var best=legal[0],bestScore=-Infinity;
     // 迭代加深確保時間不足時仍保留最後一次完整搜尋結果。
     for(var depth=1;depth<=cfg.depth;depth++){
-      var ordered=darkOrderedActions(1,depth),bi=ordered.indexOf(best);
-      if(bi>0){ordered.splice(bi,1);ordered.unshift(best);}
+      var ordered=darkOrderedActions(1,depth,best);
       var roundBest=null,roundScore=-Infinity;
       for(var i=0;i<ordered.length;i++){
+        if(darkShouldAbort())break;
         var a=ordered[i],uncertain=a.type==='reveal'||a.kind==='darkcapture'||a.kind==='darkcannon',score;
-        if(uncertain)score=darkChanceScore(a,1);
-        else{var undo=darkApplyKnown(a);score=darkSearch(0,depth-1,-Infinity,Infinity,1);darkUndoKnown(undo);}
+        if(uncertain)score=darkChanceSearch(a,1,depth,0,bag,cfg.chancePly);
+        else{
+          var undo=darkApplyKnown(a),nextProgress=undo.oldTo?0:D.noProgress+1;
+          score=darkSearch(0,depth-1,-Infinity,Infinity,1,bag,nextProgress,cfg.chancePly);darkUndoKnown(undo);
+        }
         if(DSearch.aborted)break;
         if(score>roundScore){roundScore=score;roundBest=a;}
       }
       if(DSearch.aborted)break;
-      if(roundBest){best=roundBest;bestScore=roundScore;}
+      if(roundBest){best=roundBest;bestScore=roundScore;DSearch.completedDepth=depth;}
       if(Math.abs(bestScore)>D_MATE/2)break;
     }
     return best;
